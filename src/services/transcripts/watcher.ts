@@ -1,6 +1,5 @@
 import { existsSync, statSync, watch as fsWatch, createReadStream } from 'fs';
 import { basename, join, resolve as resolvePath, sep as pathSep } from 'path';
-import { globSync } from 'glob';
 import { logger } from '../../utils/logger.js';
 import { expandHomePath } from './config.js';
 import { loadWatchState, saveWatchState, type TranscriptWatchState } from './state.js';
@@ -35,6 +34,10 @@ class FileTailer {
   close(): void {
     this.watcher?.close();
     this.watcher = null;
+  }
+
+  poke(): void {
+    this.readNewData().catch(() => undefined);
   }
 
   private async readNewData(): Promise<void> {
@@ -118,13 +121,9 @@ export class TranscriptWatcher {
     const files = this.resolveWatchFiles(resolvedPath);
 
     for (const filePath of files) {
-      await this.addTailer(filePath, watch, schema, true);
+      await this.addTailer(filePath, watch, schema);
     }
 
-    // PATHFINDER plan 03 phase 5: 5-second rescan timer replaced by a
-    // recursive fs.watch on the configured root. Requires Node 20+ on Linux
-    // for recursive mode (engines.node >= 20.0.0 — already enforced in
-    // package.json).
     const watchRoot = this.deepestNonGlobAncestor(resolvedPath);
     if (!watchRoot || !existsSync(watchRoot)) {
       logger.debug('TRANSCRIPT', 'Watch root does not exist, skipping fs.watch', { watch: watch.name, watchRoot });
@@ -133,19 +132,7 @@ export class TranscriptWatcher {
 
     try {
       const watcher = fsWatch(watchRoot, { recursive: true, persistent: true }, (event, name) => {
-        if (!name) return;                                  // some events omit filename
-        // Skip the glob scan for paths we already tail — JSONL appends fire
-        // here on every line and a full resolveWatchFiles() per append is
-        // more expensive than the prior 5-s interval. Only unknown paths
-        // warrant a rescan (new transcript files surface here first).
-        const changed = resolvePath(watchRoot, name);
-        if (this.tailers.has(changed)) return;
-        const matches = this.resolveWatchFiles(resolvedPath);
-        for (const filePath of matches) {
-          if (!this.tailers.has(filePath)) {
-            void this.addTailer(filePath, watch, schema, false);
-          }
-        }
+        this.handleRootWatchEvent(watchRoot, resolvedPath, watch, schema, name);
       });
       this.rootWatchers.push(watcher);
       logger.info('TRANSCRIPT', 'Watching transcript root recursively', { watch: watch.name, watchRoot });
@@ -157,25 +144,36 @@ export class TranscriptWatcher {
     }
   }
 
-  /**
-   * Return the deepest path component that contains no glob meta-characters.
-   * Used to anchor `fs.watch(recursive: true)` for both literal directories
-   * and patterns like `~/.codex/sessions/**\/*.jsonl`.
-   *
-   * Handles both `/` and `\` as separators so Windows-native paths
-   * (e.g. `C:\Users\x\codex\sessions\**\*.jsonl`) resolve correctly. When
-   * the input is purely glob meta (no literal prefix) we return an empty
-   * string so the caller skips the watch instead of anchoring at the
-   * filesystem root.
-   */
+  private handleRootWatchEvent(
+    watchRoot: string,
+    resolvedPath: string,
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    name: string | null
+  ): void {
+    if (!name) return;
+    const changed = resolvePath(watchRoot, name).replace(/\\/g, '/');
+    const existingTailer = this.tailers.get(changed);
+    if (existingTailer) {
+      existingTailer.poke();
+      return;
+    }
+    const matches = this.resolveWatchFiles(resolvedPath);
+    for (const filePath of matches) {
+      if (!this.tailers.has(filePath)) {
+        void this.addTailer(filePath, watch, schema);
+      }
+    }
+  }
+
   private deepestNonGlobAncestor(inputPath: string): string {
     if (!this.hasGlob(inputPath)) {
-      // Literal path: if it's a file, return its directory; otherwise return as-is.
       if (existsSync(inputPath)) {
         try {
           const stat = statSync(inputPath);
           return stat.isDirectory() ? inputPath : resolvePath(inputPath, '..');
-        } catch {
+        } catch (error: unknown) {
+          logger.debug('TRANSCRIPT', 'Failed to stat watch path ancestor, falling back to parent directory', { path: inputPath }, error instanceof Error ? error : new Error(String(error)));
           return resolvePath(inputPath, '..');
         }
       }
@@ -190,8 +188,6 @@ export class TranscriptWatcher {
     }
     if (literalSegments.length === 0) return '';
     if (literalSegments.length === 1 && literalSegments[0] === '') {
-      // Input started with a separator but the first real segment was a
-      // glob (e.g. `/**/foo`). Don't silently broaden the watch to `/`.
       return '';
     }
     return literalSegments.join(pathSep);
@@ -206,7 +202,7 @@ export class TranscriptWatcher {
 
   private resolveWatchFiles(inputPath: string): string[] {
     if (this.hasGlob(inputPath)) {
-      return globSync(inputPath, { nodir: true, absolute: true });
+      return this.scanGlob(this.normalizeGlobPattern(inputPath));
     }
 
     if (existsSync(inputPath)) {
@@ -214,7 +210,7 @@ export class TranscriptWatcher {
         const stat = statSync(inputPath);
         if (stat.isDirectory()) {
           const pattern = join(inputPath, '**', '*.jsonl');
-          return globSync(pattern, { nodir: true, absolute: true });
+          return this.scanGlob(this.normalizeGlobPattern(pattern));
         }
         return [inputPath];
       } catch (error: unknown) {
@@ -226,6 +222,14 @@ export class TranscriptWatcher {
     return [];
   }
 
+  private scanGlob(pattern: string): string[] {
+    return Array.from(new Bun.Glob(pattern).scanSync({ absolute: true, onlyFiles: true }));
+  }
+
+  private normalizeGlobPattern(inputPath: string): string {
+    return inputPath.replace(/\\/g, '/');
+  }
+
   private hasGlob(inputPath: string): boolean {
     return /[*?[\]{}()]/.test(inputPath);
   }
@@ -233,17 +237,14 @@ export class TranscriptWatcher {
   private async addTailer(
     filePath: string,
     watch: WatchTarget,
-    schema: TranscriptSchema,
-    initialDiscovery: boolean
+    schema: TranscriptSchema
   ): Promise<void> {
     if (this.tailers.has(filePath)) return;
 
     const sessionIdOverride = this.extractSessionIdFromPath(filePath);
 
     let offset = this.state.offsets[filePath] ?? 0;
-    // `startAtEnd` is useful on worker startup to avoid replaying the full backlog,
-    // but new transcript files must be read from byte 0 or we lose session_meta/user_message.
-    if (offset === 0 && watch.startAtEnd && initialDiscovery) {
+    if (offset === 0 && watch.startAtEnd) {
       try {
         offset = statSync(filePath).size;
       } catch (error: unknown) {

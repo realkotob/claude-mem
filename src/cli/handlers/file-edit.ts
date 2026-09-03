@@ -1,15 +1,10 @@
-/**
- * File Edit Handler - Cursor-specific afterFileEdit
- *
- * Handles file edit observations from Cursor IDE.
- * Similar to observation handler but with file-specific metadata.
- */
 
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { shouldTrackProject } from '../../shared/should-track-project.js';
 
 export const fileEditHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
@@ -24,13 +19,15 @@ export const fileEditHandler: EventHandler = {
       editCount: edits?.length ?? 0
     });
 
-    // Plan 05 Phase 6: cwd is validated at the adapter boundary; this is a
-    // belt-and-suspenders type guard so TypeScript narrows.
     if (!cwd) {
       throw new Error(`Missing cwd in FileEdit hook input for session ${sessionId}, file ${filePath}`);
     }
 
-    // Plan 05 Phase 2: single helper for ensure-worker-alive → request → fallback.
+    if (!shouldTrackProject(cwd)) {
+      logger.debug('HOOK', 'Project excluded from tracking, skipping file edit observation', { cwd, filePath });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
     const result = await executeWithWorkerFallback<{ status?: string }>(
       '/api/sessions/observations',
       'POST',

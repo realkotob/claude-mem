@@ -1,24 +1,20 @@
-/**
- * ContextBuilder - Main orchestrator for context generation
- *
- * Coordinates all context generation components to build the final output.
- * This is the primary entry point for context generation.
- */
 
 import path from 'path';
 import { homedir } from 'os';
-import { unlinkSync } from 'fs';
-import { SessionStore } from '../sqlite/SessionStore.js';
+import { existsSync, unlinkSync } from 'fs';
+import { Database } from 'bun:sqlite';
+import { DB_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import { getProjectContext } from '../../utils/project-name.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { SQLITE_BUSY_TIMEOUT_MS } from '../sqlite/connection.js';
 
 import type { ContextInput, ContextConfig, Observation, SessionSummary } from './types.js';
+import { colors } from './types.js';
 import { loadContextConfig } from './ContextConfigLoader.js';
 import { calculateTokenEconomics } from './TokenCalculator.js';
 import {
-  queryObservations,
   queryObservationsMulti,
-  querySummaries,
   querySummariesMulti,
   getPriorSessionMessages,
   prepareSummariesForTimeline,
@@ -31,8 +27,12 @@ import { shouldShowSummary, renderSummaryFields } from './sections/SummaryRender
 import { renderPreviouslySection, renderFooter } from './sections/FooterRenderer.js';
 import { renderAgentEmptyState } from './formatters/AgentFormatter.js';
 import { renderHumanEmptyState } from './formatters/HumanFormatter.js';
+import {
+  readObserverHealth,
+  isObserverUnhealthy,
+  renderObserverHealthWarning,
+} from '../../shared/observer-health.js';
 
-// Version marker path for native module error handling
 const VERSION_MARKER_PATH = path.join(
   homedir(),
   '.claude',
@@ -43,12 +43,17 @@ const VERSION_MARKER_PATH = path.join(
   '.install-version'
 );
 
-/**
- * Initialize database connection with error handling
- */
-function initializeDatabase(): SessionStore | null {
+function initializeDatabase(): Database | null {
   try {
-    return new SessionStore();
+    if (!existsSync(DB_PATH)) return null;
+    const db = new Database(DB_PATH, { readonly: true, create: false });
+    try {
+      db.run(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+      return db;
+    } catch (error) {
+      db.close();
+      throw error;
+    }
   } catch (error: unknown) {
     if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ERR_DLOPEN_FAILED') {
       try {
@@ -67,16 +72,10 @@ function initializeDatabase(): SessionStore | null {
   }
 }
 
-/**
- * Render empty state when no data exists
- */
 function renderEmptyState(project: string, forHuman: boolean): string {
   return forHuman ? renderHumanEmptyState(project) : renderAgentEmptyState(project);
 }
 
-/**
- * Build context output from loaded data
- */
 function buildContextOutput(
   project: string,
   observations: Observation[],
@@ -88,22 +87,17 @@ function buildContextOutput(
 ): string {
   const output: string[] = [];
 
-  // Calculate token economics
   const economics = calculateTokenEconomics(observations);
 
-  // Render header section
   output.push(...renderHeader(project, economics, config, forHuman));
 
-  // Prepare timeline data
   const displaySummaries = summaries.slice(0, config.sessionCount);
   const summariesForTimeline = prepareSummariesForTimeline(displaySummaries, summaries);
   const timeline = buildTimeline(observations, summariesForTimeline);
   const fullObservationIds = getFullObservationIds(observations, config.fullObservationCount);
 
-  // Render timeline
   output.push(...renderTimeline(timeline, fullObservationIds, config, cwd, forHuman));
 
-  // Render most recent summary if applicable
   const mostRecentSummary = summaries[0];
   const mostRecentObservation = observations[0];
 
@@ -111,64 +105,144 @@ function buildContextOutput(
     output.push(...renderSummaryFields(mostRecentSummary, forHuman));
   }
 
-  // Render previously section (prior assistant message)
   const priorMessages = getPriorSessionMessages(observations, config, sessionId, cwd);
   output.push(...renderPreviouslySection(priorMessages, forHuman));
 
-  // Render footer
   output.push(...renderFooter(economics, config, forHuman));
 
   return output.join('\n').trimEnd();
 }
 
 /**
- * Generate context for a project
- *
- * Main entry point for context generation. Orchestrates loading config,
- * querying data, and rendering the final context string.
+ * Telemetry-facing shape of one context injection. Counts, booleans, and our
+ * own enum strings only — computed from the same observation set that was
+ * rendered, never from user content.
  */
-export async function generateContext(
+export interface ContextInjectStats {
+  observation_count: number;
+  session_count: number;
+  timeline_depth_days: number;
+  has_session_summary: boolean;
+  obs_type_bugfix: number;
+  obs_type_discovery: number;
+  obs_type_decision: number;
+  obs_type_refactor: number;
+  obs_type_other: number;
+  tokens_injected: number;
+  tokens_saved_vs_naive: number;
+  search_strategy: string;
+}
+
+const STAT_TYPE_BUCKETS = new Set(['bugfix', 'discovery', 'decision', 'refactor']);
+
+function buildInjectStats(
+  observations: Observation[],
+  summaries: SessionSummary[],
+  full: boolean
+): ContextInjectStats {
+  const economics = calculateTokenEconomics(observations);
+  const typeCounts: Record<string, number> = {
+    bugfix: 0, discovery: 0, decision: 0, refactor: 0, other: 0,
+  };
+  const sessionIds = new Set<string>();
+  let oldestEpoch = Number.POSITIVE_INFINITY;
+  for (const obs of observations) {
+    const bucket = STAT_TYPE_BUCKETS.has(obs.type) ? obs.type : 'other';
+    typeCounts[bucket]++;
+    if (obs.memory_session_id) sessionIds.add(obs.memory_session_id);
+    if (obs.created_at_epoch && obs.created_at_epoch < oldestEpoch) {
+      oldestEpoch = obs.created_at_epoch;
+    }
+  }
+  const timelineDepthDays = Number.isFinite(oldestEpoch)
+    ? Math.max(0, Math.floor((Date.now() - oldestEpoch) / 86_400_000))
+    : 0;
+
+  return {
+    observation_count: observations.length,
+    session_count: sessionIds.size,
+    timeline_depth_days: timelineDepthDays,
+    has_session_summary: summaries.length > 0,
+    obs_type_bugfix: typeCounts.bugfix,
+    obs_type_discovery: typeCounts.discovery,
+    obs_type_decision: typeCounts.decision,
+    obs_type_refactor: typeCounts.refactor,
+    obs_type_other: typeCounts.other,
+    tokens_injected: economics.totalReadTokens,
+    tokens_saved_vs_naive: economics.savings,
+    search_strategy: full ? 'full' : 'timeline',
+  };
+}
+
+/**
+ * Paint every non-blank line, rather than wrapping the block once: session
+ * context is long enough to scroll, and a single leading escape leaves the
+ * warning uncolored wherever the terminal reflows or the reader scrolls back.
+ */
+function paintRed(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => (line.trim() ? `${colors.red}${line}${colors.reset}` : line))
+    .join('\n');
+}
+
+/**
+ * Append the observer-health outage warning when the observer is failing.
+ * Applied to EVERY context path (including empty-state, missing-DB, and the
+ * no-memories-yet welcome hint in SearchRoutes) so the outage is surfaced even
+ * when there is nothing else to render.
+ *
+ * BELOW the context, not above it: the timeline runs long, so a warning at the
+ * top has already scrolled off by the time the context finishes printing. The
+ * last thing rendered is the thing still on screen — and for the model, the
+ * closest thing to its first reply.
+ */
+export function withObserverHealthWarning(text: string, forHuman: boolean = false): string {
+  const health = readObserverHealth();
+  if (!isObserverUnhealthy(health)) {
+    return text;
+  }
+  const warning = renderObserverHealthWarning(health);
+  // Colors only on the human render: the agent copy is fetched separately
+  // (colors=false) and ANSI escapes there are noise in the model's context.
+  const rendered = forHuman ? paintRed(warning) : warning;
+  return text ? `${text}\n\n${rendered}` : rendered;
+}
+
+export async function generateContextWithStats(
   input?: ContextInput,
   forHuman: boolean = false
-): Promise<string> {
+): Promise<{ text: string; stats: ContextInjectStats | null }> {
   const config = loadContextConfig();
   const cwd = input?.cwd ?? process.cwd();
   const context = getProjectContext(cwd);
 
-  // Single source of truth: explicit projects override cwd-derived context.
-  // `project` (used for header + single-project query) is always the last entry
-  // of `projects` so the empty-state header and the query target stay in sync
-  // when a caller passes `projects` without a matching cwd (e.g. worker route).
   const projects = input?.projects?.length ? input.projects : context.allProjects;
   const project = projects[projects.length - 1] ?? context.primary;
 
-  // Full mode: fetch all observations but keep normal rendering (level 1 summaries)
   if (input?.full) {
     config.totalObservationCount = 999999;
     config.sessionCount = 999999;
   }
 
-  // Initialize database
-  const db = initializeDatabase();
-  if (!db) {
-    return '';
+  const rawDb = initializeDatabase();
+  if (!rawDb) {
+    return { text: withObserverHealthWarning('', forHuman), stats: null };
   }
 
   try {
-    // Query data for all projects (supports worktree: parent + worktree combined)
-    const observations = projects.length > 1
-      ? queryObservationsMulti(db, projects, config)
-      : queryObservations(db, project, config);
-    const summaries = projects.length > 1
-      ? querySummariesMulti(db, projects, config)
-      : querySummaries(db, project, config);
+    const db = { db: rawDb };
+    const platformSource = input?.platformSource
+      ? normalizePlatformSource(input.platformSource)
+      : undefined;
+    const queryProjects = projects.length > 1 ? projects : [project];
+    const observations = queryObservationsMulti(db, queryProjects, config, platformSource);
+    const summaries = querySummariesMulti(db, queryProjects, config, platformSource);
 
-    // Handle empty state
     if (observations.length === 0 && summaries.length === 0) {
-      return renderEmptyState(project, forHuman);
+      return { text: withObserverHealthWarning(renderEmptyState(project, forHuman), forHuman), stats: null };
     }
 
-    // Build and return context
     const output = buildContextOutput(
       project,
       observations,
@@ -179,8 +253,18 @@ export async function generateContext(
       forHuman
     );
 
-    return output;
+    return {
+      text: withObserverHealthWarning(output, forHuman),
+      stats: buildInjectStats(observations, summaries, Boolean(input?.full)),
+    };
   } finally {
-    db.close();
+    rawDb.close();
   }
+}
+
+export async function generateContext(
+  input?: ContextInput,
+  forHuman: boolean = false
+): Promise<string> {
+  return (await generateContextWithStats(input, forHuman)).text;
 }

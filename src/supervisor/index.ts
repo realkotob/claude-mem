@@ -1,6 +1,4 @@
 import { existsSync, readFileSync, rmSync } from 'fs';
-import { homedir } from 'os';
-import path from 'path';
 import { logger } from '../utils/logger.js';
 import {
   getProcessRegistry,
@@ -11,9 +9,9 @@ import {
 } from './process-registry.js';
 import { runShutdownCascade } from './shutdown.js';
 import { startHealthChecker, stopHealthChecker } from './health-checker.js';
+import { paths } from '../shared/paths.js';
 
-const DATA_DIR = path.join(homedir(), '.claude-mem');
-const PID_FILE = path.join(DATA_DIR, 'worker.pid');
+const PID_FILE = paths.workerPid();
 
 interface ValidateWorkerPidOptions {
   logAlive?: boolean;
@@ -152,6 +150,23 @@ export function getSupervisor(): Supervisor {
 
 export function configureSupervisorSignalHandlers(shutdownHandler: () => Promise<void>): void {
   supervisorSingleton.configureSignalHandlers(shutdownHandler);
+}
+
+/**
+ * The verified-owner PID info from the worker PID file, or null when the file
+ * is missing, unparseable, or names a process that is not a live claude-mem
+ * worker. Read-only sibling of validateWorkerPidFile for callers that need
+ * the pid itself (the hook's stale-worker kill in shared/worker-utils.ts).
+ */
+export function readOwnedWorkerPidInfo(): PidInfo | null {
+  if (!existsSync(PID_FILE)) return null;
+  let pidInfo: PidInfo | null;
+  try {
+    pidInfo = JSON.parse(readFileSync(PID_FILE, 'utf-8')) as PidInfo | null;
+  } catch {
+    return null;
+  }
+  return pidInfo !== null && verifyPidFileOwnership(pidInfo) ? pidInfo : null;
 }
 
 export function validateWorkerPidFile(options: ValidateWorkerPidOptions = {}): ValidateWorkerPidStatus {

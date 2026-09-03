@@ -1,10 +1,3 @@
-/**
- * TelegramNotifier
- *
- * Fire-and-forget Telegram notification module. Fires one message per observation
- * whose type or concepts match user-configured triggers. Never throws; all errors
- * are caught per-observation and logged as warnings. Bot token is never logged.
- */
 
 import { ParsedObservation } from '../../sdk/parser.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
@@ -20,11 +13,10 @@ export interface TelegramNotifyInput {
 
 const MARKDOWN_V2_RESERVED = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
 
-// Emoji per observation type. Unknown types fall back to the generic 🔔 so
-// the message is still readable rather than misleadingly loud.
 const TYPE_EMOJI: Record<string, string> = {
   security_alert: '🚨',
   security_note: '🔐',
+  sensitive: '🤫',
 };
 const DEFAULT_EMOJI = '🔔';
 
@@ -73,9 +65,6 @@ async function postOne(botToken: string, chatId: string, text: string): Promise<
 }
 
 export async function notifyTelegram(input: TelegramNotifyInput): Promise<void> {
-  // loadFromFile merges env > settings.json > defaults so values stored in
-  // ~/.claude-mem/settings.json actually take effect. SettingsDefaultsManager.get()
-  // alone skips the file and would silently ignore user-configured credentials.
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
   if (settings.CLAUDE_MEM_TELEGRAM_ENABLED !== 'true') {
@@ -108,12 +97,13 @@ export async function notifyTelegram(input: TelegramNotifyInput): Promise<void> 
       const text = formatMessage(obs, project, memorySessionId, observationId);
       await postOne(botToken, chatId, text);
     } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
       logger.warn('TELEGRAM', 'Failed to send Telegram notification', {
         observationId,
         project,
         memorySessionId,
         type: obs.type,
-      }, error as Error);
+      }, err);
     }
   }
 }

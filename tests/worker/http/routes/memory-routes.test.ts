@@ -1,16 +1,15 @@
-/**
- * MemoryRoutes Tests — POST /api/memory/save (#2116)
- *
- * Asserts:
- *  - `metadata` is persisted verbatim (no silent drop)
- *  - top-level `project` wins; `metadata.project` used as fallback
- *  - unknown top-level fields are rejected (400) — no silent drop
- *  - chromaSync is invoked when present, skipped when absent
- */
-
-import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
 import type { Request, Response } from 'express';
 import { logger } from '../../../../src/utils/logger.js';
+
+// Snapshot the real modules BEFORE mock.module mutates the live namespaces,
+// then re-register them in afterAll. bun's mock.module is process-global and
+// mock.restore() does NOT undo it, so these partial stubs would otherwise leak
+// into other test files in the same `bun test` run.
+import * as realPaths from '../../../../src/shared/paths.js';
+import * as realWorkerUtils from '../../../../src/shared/worker-utils.js';
+const realPathsSnapshot = { ...realPaths };
+const realWorkerUtilsSnapshot = { ...realWorkerUtils };
 
 mock.module('../../../../src/shared/paths.js', () => ({
   getPackageRoot: () => '/tmp/test',
@@ -18,6 +17,11 @@ mock.module('../../../../src/shared/paths.js', () => ({
 mock.module('../../../../src/shared/worker-utils.js', () => ({
   getWorkerPort: () => 37777,
 }));
+
+afterAll(() => {
+  mock.module('../../../../src/shared/paths.js', () => realPathsSnapshot);
+  mock.module('../../../../src/shared/worker-utils.js', () => realWorkerUtilsSnapshot);
+});
 
 import { MemoryRoutes } from '../../../../src/services/worker/http/routes/MemoryRoutes.js';
 
@@ -79,15 +83,15 @@ describe('MemoryRoutes — POST /api/memory/save (#2116)', () => {
       storeObservationCalls.push(args);
       return { id: 42, createdAtEpoch: 1234567890 };
     });
-    mockGetOrCreateManualSession = mock((project: string) => `manual-${project}`);
+    mockGetOrCreateManualSession = mock((project: string, _platformSource?: string) => `manual-${project}`);
 
     const mockDbManager = {
       getSessionStore: () => ({
         storeObservation: mockStoreObservation,
         getOrCreateManualSession: mockGetOrCreateManualSession,
       }),
-      // Return null so we skip the chroma path in tests
       getChromaSync: () => null,
+      getCloudSync: () => null,
     };
 
     routes = new MemoryRoutes(mockDbManager as any, 'claude-mem');
@@ -142,7 +146,7 @@ describe('MemoryRoutes — POST /api/memory/save (#2116)', () => {
     });
     handler(req as Request, res as Response);
 
-    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('top-level-project');
+    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('top-level-project', undefined);
     expect(storeObservationCalls[0][1]).toBe('top-level-project');
   });
 
@@ -154,7 +158,7 @@ describe('MemoryRoutes — POST /api/memory/save (#2116)', () => {
     });
     handler(req as Request, res as Response);
 
-    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('my-custom-project');
+    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('my-custom-project', undefined);
     expect(storeObservationCalls[0][1]).toBe('my-custom-project');
   });
 
@@ -163,8 +167,19 @@ describe('MemoryRoutes — POST /api/memory/save (#2116)', () => {
     const { req, res } = createMockReqRes({ text: 'hello' });
     handler(req as Request, res as Response);
 
-    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('claude-mem');
+    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('claude-mem', undefined);
     expect(storeObservationCalls[0][1]).toBe('claude-mem');
+  });
+
+  it('honors metadata.platformSource on manual save', () => {
+    const handler = buildHandler();
+    const { req, res } = createMockReqRes({
+      text: 'hello from cursor',
+      metadata: { platformSource: 'cursor' },
+    });
+    handler(req as Request, res as Response);
+
+    expect(mockGetOrCreateManualSession).toHaveBeenCalledWith('claude-mem', 'cursor');
   });
 
   it('rejects unknown top-level fields with HTTP 400 (no silent drop)', () => {

@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Entrypoint for the basic claude-mem container. Seeds OAuth creds if a
-# credentials file is mounted, then exec's whatever was passed (default: bash).
-#
-# Env vars:
-#   CLAUDE_MEM_CREDENTIALS_FILE  Path to a mounted OAuth credentials JSON file
-#                                (e.g. /auth/.credentials.json). Copied into
-#                                $HOME/.claude/.credentials.json at startup.
-#   ANTHROPIC_API_KEY            Standard API-key auth; set when OAuth isn't used.
+
+# Phase 10 — server-beta container entrypoint. The container ALWAYS runs the
+# server-beta runtime; the legacy worker is never started here. Generation can
+# be split into a separate `claude-mem server worker start` process by setting
+# CLAUDE_MEM_GENERATION_DISABLED=true on this service and running the worker
+# command in a sibling container.
 
 set -euo pipefail
 
@@ -21,8 +19,43 @@ if [[ -n "${CLAUDE_MEM_CREDENTIALS_FILE:-}" ]]; then
   chmod 600 "$HOME/.claude/.credentials.json"
 fi
 
-# Helpful one-liner for interactive users: run `claude` with the plugin dir
-# preconfigured. Don't force it — `exec "$@"` lets you override freely.
 export PATH="/usr/local/bun/bin:/usr/local/share/npm-global/bin:$PATH"
 
-exec "$@"
+# Mark this process tree as running inside Docker so server-beta env
+# validation can refuse local-dev auth and require the full Postgres+Valkey
+# configuration. /.dockerenv is also detected automatically; this is belt-
+# and-suspenders for runtimes that don't expose it.
+export CLAUDE_MEM_DOCKER=1
+export CLAUDE_MEM_RUNTIME="${CLAUDE_MEM_RUNTIME:-server-beta}"
+
+SERVER_BETA_SCRIPT="/opt/claude-mem/scripts/server-service.cjs"
+
+# Mode selection:
+#   CLAUDE_MEM_CONTAINER_MODE=server (default) — HTTP server-beta, no worker
+#   CLAUDE_MEM_CONTAINER_MODE=worker          — BullMQ generation worker only
+#   CLAUDE_MEM_CONTAINER_MODE=shell           — fall through to "$@" for tooling
+MODE="${CLAUDE_MEM_CONTAINER_MODE:-server}"
+
+case "$MODE" in
+  server)
+    echo "[claude-mem] starting server-beta runtime (HTTP, no legacy worker)" >&2
+    exec bun "$SERVER_BETA_SCRIPT" --daemon
+    ;;
+  worker)
+    echo "[claude-mem] starting server-beta generation worker (no HTTP)" >&2
+    # Force generation enabled in the worker process even if the env var was
+    # set on the shared compose file; the worker IS the generation process.
+    unset CLAUDE_MEM_GENERATION_DISABLED
+    exec bun "$SERVER_BETA_SCRIPT" worker start
+    ;;
+  shell|tooling)
+    if [[ $# -eq 0 ]]; then
+      exec bash
+    fi
+    exec "$@"
+    ;;
+  *)
+    echo "ERROR: unknown CLAUDE_MEM_CONTAINER_MODE=$MODE (expected: server, worker, shell)" >&2
+    exit 1
+    ;;
+esac

@@ -1,59 +1,26 @@
-/**
- * McpIntegrations - MCP-based IDE integrations for claude-mem
- *
- * Handles MCP config writing and context injection for IDEs that support
- * the Model Context Protocol. These are "MCP-only" integrations: they provide
- * search tools and context injection but do NOT capture transcripts.
- *
- * Supported IDEs:
- *   - Copilot CLI
- *   - Antigravity (Gemini)
- *   - Goose
- *   - Crush
- *   - Roo Code
- *   - Warp
- *
- * All IDEs point to the same MCP server: plugin/scripts/mcp-server.cjs
- */
 
 import path from 'path';
 import { homedir } from 'os';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { logger } from '../../utils/logger.js';
-import { findMcpServerPath } from './CursorHooksInstaller.js';
+import { getMcpServerAbsolutePath, getNodeAbsolutePath } from './install-paths.js';
 import { readJsonSafe } from '../../utils/json-utils.js';
 import { injectContextIntoMarkdownFile } from '../../utils/context-injection.js';
 
-// ============================================================================
-// Shared Constants
-// ============================================================================
-
-const PLACEHOLDER_CONTEXT = `# claude-mem: Cross-Session Memory
+export const PLACEHOLDER_CONTEXT = `# claude-mem: Cross-Session Memory
 
 *No context yet. Complete your first session and context will appear here.*
 
 Use claude-mem's MCP search tools for manual memory queries.`;
 
-// ============================================================================
-// Shared Utilities
-// ============================================================================
-
-/**
- * Build the standard MCP server entry that all IDEs use.
- * Points to the same mcp-server.cjs script.
- */
-function buildMcpServerEntry(mcpServerPath: string): { command: string; args: string[] } {
+export function buildMcpServerEntry(mcpServerPath: string): { command: string; args: string[] } {
   return {
-    command: process.execPath,
+    command: getNodeAbsolutePath(),
     args: [mcpServerPath],
   };
 }
 
-/**
- * Write a standard MCP JSON config file, merging with existing config.
- * Supports both { "mcpServers": { ... } } and { "servers": { ... } } formats.
- */
-function writeMcpJsonConfig(
+export function writeMcpJsonConfig(
   configFilePath: string,
   mcpServerPath: string,
   serversKeyName: string = 'mcpServers',
@@ -72,33 +39,19 @@ function writeMcpJsonConfig(
   writeFileSync(configFilePath, JSON.stringify(existingConfig, null, 2) + '\n');
 }
 
-// ============================================================================
-// MCP Installer Factory (Phase 1D)
-// ============================================================================
-
-/**
- * Configuration for a JSON-based MCP IDE integration.
- */
 interface McpInstallerConfig {
   ideId: string;
   ideLabel: string;
   configPath: string;
   configKey: 'servers' | 'mcpServers';
-  contextFile?: {
-    path: string;
-    isWorkspaceRelative: boolean;
-  };
+  contextPath?: string;
 }
 
-/**
- * Factory function that creates an MCP installer for any JSON-config-based IDE.
- * Handles MCP config writing and optional context injection.
- */
 function installMcpIntegration(config: McpInstallerConfig): () => Promise<number> {
   return async (): Promise<number> => {
     console.log(`\nInstalling Claude-Mem MCP integration for ${config.ideLabel}...\n`);
 
-    const mcpServerPath = findMcpServerPath();
+    const mcpServerPath = getMcpServerAbsolutePath();
     if (!mcpServerPath) {
       console.error('Could not find MCP server script');
       console.error('   Expected at: ~/.claude/plugins/marketplaces/thedotmack/plugin/scripts/mcp-server.cjs');
@@ -107,13 +60,9 @@ function installMcpIntegration(config: McpInstallerConfig): () => Promise<number
 
     const configPath = config.configPath;
 
-    // Warp special case: skip config write if ~/.warp/ doesn't exist
     const skipWarpConfigWrite = config.ideId === 'warp' && !existsSync(path.dirname(configPath));
 
-    let contextPath: string | undefined;
-    if (config.contextFile) {
-      contextPath = config.contextFile.path;
-    }
+    const contextPath = config.contextPath;
 
     try {
       writeMcpConfigAndContext(config, configPath, mcpServerPath, skipWarpConfigWrite, contextPath);
@@ -164,37 +113,12 @@ function writeMcpConfigAndContext(
   console.log(summaryLines.join('\n'));
 }
 
-// ============================================================================
-// Factory Configs for JSON-based IDEs
-// ============================================================================
-
 const COPILOT_CLI_CONFIG: McpInstallerConfig = {
   ideId: 'copilot-cli',
   ideLabel: 'Copilot CLI',
   configPath: path.join(homedir(), '.github', 'copilot', 'mcp.json'),
   configKey: 'servers',
-  contextFile: {
-    path: path.join(process.cwd(), '.github', 'copilot-instructions.md'),
-    isWorkspaceRelative: true,
-  },
-};
-
-const ANTIGRAVITY_CONFIG: McpInstallerConfig = {
-  ideId: 'antigravity',
-  ideLabel: 'Antigravity',
-  configPath: path.join(homedir(), '.gemini', 'antigravity', 'mcp_config.json'),
-  configKey: 'mcpServers',
-  contextFile: {
-    path: path.join(process.cwd(), '.agents', 'rules', 'claude-mem-context.md'),
-    isWorkspaceRelative: true,
-  },
-};
-
-const CRUSH_CONFIG: McpInstallerConfig = {
-  ideId: 'crush',
-  ideLabel: 'Crush',
-  configPath: path.join(homedir(), '.config', 'crush', 'mcp.json'),
-  configKey: 'mcpServers',
+  contextPath: path.join(process.cwd(), '.github', 'copilot-instructions.md'),
 };
 
 const ROO_CODE_CONFIG: McpInstallerConfig = {
@@ -202,10 +126,7 @@ const ROO_CODE_CONFIG: McpInstallerConfig = {
   ideLabel: 'Roo Code',
   configPath: path.join(process.cwd(), '.roo', 'mcp.json'),
   configKey: 'mcpServers',
-  contextFile: {
-    path: path.join(process.cwd(), '.roo', 'rules', 'claude-mem-context.md'),
-    isWorkspaceRelative: true,
-  },
+  contextPath: path.join(process.cwd(), '.roo', 'rules', 'claude-mem-context.md'),
 };
 
 const WARP_CONFIG: McpInstallerConfig = {
@@ -213,73 +134,32 @@ const WARP_CONFIG: McpInstallerConfig = {
   ideLabel: 'Warp',
   configPath: path.join(homedir(), '.warp', 'mcp.json'),
   configKey: 'mcpServers',
-  contextFile: {
-    path: path.join(process.cwd(), 'WARP.md'),
-    isWorkspaceRelative: true,
-  },
+  contextPath: path.join(process.cwd(), 'WARP.md'),
 };
 
-// ============================================================================
-// Goose (YAML-based — separate handler)
-// ============================================================================
-
-/**
- * Get the Goose config path.
- * Goose stores its config at ~/.config/goose/config.yaml.
- */
 function getGooseConfigPath(): string {
   return path.join(homedir(), '.config', 'goose', 'config.yaml');
 }
 
-/**
- * Check if a YAML string already has a claude-mem entry under mcpServers.
- * Uses string matching to avoid needing a YAML parser.
- */
 function gooseConfigHasClaudeMemEntry(yamlContent: string): boolean {
-  // Look for "claude-mem:" indented under mcpServers
   return yamlContent.includes('claude-mem:') &&
     yamlContent.includes('mcpServers:');
 }
 
-/**
- * Build the Goose YAML MCP server block as a string.
- * Produces properly indented YAML without needing a parser.
- */
-function buildGooseMcpYamlBlock(mcpServerPath: string): string {
-  // Goose expects the mcpServers section at the top level
+function buildGooseClaudeMemEntryYaml(mcpServerPath: string, withHeader = false): string {
   return [
-    'mcpServers:',
+    ...(withHeader ? ['mcpServers:'] : []),
     '  claude-mem:',
-    `    command: ${process.execPath}`,
+    `    command: ${getNodeAbsolutePath()}`,
     '    args:',
     `      - ${mcpServerPath}`,
   ].join('\n');
 }
 
-/**
- * Build just the claude-mem server entry (for appending under existing mcpServers).
- */
-function buildGooseClaudeMemEntryYaml(mcpServerPath: string): string {
-  return [
-    '  claude-mem:',
-    `    command: ${process.execPath}`,
-    '    args:',
-    `      - ${mcpServerPath}`,
-  ].join('\n');
-}
-
-/**
- * Install claude-mem MCP integration for Goose.
- *
- * - Writes/merges MCP config into ~/.config/goose/config.yaml
- * - Uses string manipulation for YAML (no parser dependency)
- *
- * @returns 0 on success, 1 on failure
- */
 export async function installGooseMcpIntegration(): Promise<number> {
   console.log('\nInstalling Claude-Mem MCP integration for Goose...\n');
 
-  const mcpServerPath = findMcpServerPath();
+  const mcpServerPath = getMcpServerAbsolutePath();
   if (!mcpServerPath) {
     console.error('Could not find MCP server script');
     console.error('   Expected at: ~/.claude/plugins/marketplaces/thedotmack/plugin/scripts/mcp-server.cjs');
@@ -327,13 +207,13 @@ function mergeGooseYamlConfig(configPath: string, mcpServerPath: string): void {
       writeFileSync(configPath, yamlContent);
       console.log(`  Added claude-mem to existing mcpServers in: ${configPath}`);
     } else {
-      const mcpBlock = '\n' + buildGooseMcpYamlBlock(mcpServerPath) + '\n';
+      const mcpBlock = '\n' + buildGooseClaudeMemEntryYaml(mcpServerPath, true) + '\n';
       yamlContent = yamlContent.trimEnd() + '\n' + mcpBlock;
       writeFileSync(configPath, yamlContent);
       console.log(`  Appended mcpServers section to: ${configPath}`);
     }
   } else {
-    const templateContent = buildGooseMcpYamlBlock(mcpServerPath) + '\n';
+    const templateContent = buildGooseClaudeMemEntryYaml(mcpServerPath, true) + '\n';
     writeFileSync(configPath, templateContent);
     console.log(`  Created config with MCP server: ${configPath}`);
   }
@@ -352,19 +232,15 @@ Next steps:
 `);
 }
 
-// ============================================================================
-// Unified Installer (used by npx install command)
-// ============================================================================
-
-/**
- * Map of IDE identifiers to their install functions.
- * Used by the install command to dispatch to the correct integration.
- */
+// NOTE: 'antigravity' is intentionally absent here. It graduated from an
+// MCP-only integration to a full hooks+MCP installer — see
+// AntigravityCliHooksInstaller.ts, which owns Antigravity's install/uninstall
+// end-to-end (reusing writeMcpJsonConfig/buildMcpServerEntry from this file
+// for its MCP half). Leaving an entry here too would create two competing
+// install paths for the same IDE.
 export const MCP_IDE_INSTALLERS: Record<string, () => Promise<number>> = {
   'copilot-cli': installMcpIntegration(COPILOT_CLI_CONFIG),
-  'antigravity': installMcpIntegration(ANTIGRAVITY_CONFIG),
   'goose': installGooseMcpIntegration,
-  'crush': installMcpIntegration(CRUSH_CONFIG),
   'roo-code': installMcpIntegration(ROO_CODE_CONFIG),
   'warp': installMcpIntegration(WARP_CONFIG),
 };

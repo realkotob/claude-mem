@@ -1,21 +1,17 @@
-/**
- * Tests for subagent-context short-circuit in summarizeHandler.
- *
- * Validates that when the Stop hook fires inside a Claude Code subagent
- * (identified by `agentId` or `agentType` on NormalizedHookInput), the
- * summarize handler exits before calling the worker — subagents must not
- * own the session summary.
- *
- * Sources:
- * - Handler: src/cli/handlers/summarize.ts
- * - Mock pattern: tests/hooks/context-reinjection-guard.test.ts
- */
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn, mock } from 'bun:test';
 import { homedir } from 'os';
 import { join } from 'path';
 
-// Mock modules that touch the filesystem / network at import time.
-// MUST be declared before the handler is imported.
+// Capture real exports before mock.module mutates the live namespace, then
+// re-register the snapshots in afterAll so these mocks do not leak into later
+// test files (bun's mock.module is process-global; mock.restore() does NOT undo it).
+import * as realSettingsDefaultsManager from '../../../src/shared/SettingsDefaultsManager.js';
+import * as realHookSettings from '../../../src/shared/hook-settings.js';
+import * as realWorkerUtils from '../../../src/shared/worker-utils.js';
+const realSettingsSnapshot = { ...realSettingsDefaultsManager };
+const realHookSettingsSnapshot = { ...realHookSettings };
+const realWorkerUtilsSnapshot = { ...realWorkerUtils };
+
 mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
   SettingsDefaultsManager: {
     get: (key: string) => {
@@ -23,13 +19,18 @@ mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
       return '';
     },
     getInt: () => 0,
-    loadFromFile: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: [] }),
+    loadFromFile: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: '' }),
   },
 }));
 
-// workerHttpRequest is the only worker entry point we must NOT call in
-// subagent context. It throws so we can assert "never called" by proving
-// the handler returns success anyway.
+// loadFromFileOnce() module-caches its result, so mocking SettingsDefaultsManager
+// alone is not enough — an earlier test may have already cached real settings.
+// Mock hook-settings directly so shouldTrackProject() always sees a string
+// CLAUDE_MEM_EXCLUDED_PROJECTS regardless of global mock/cache state.
+mock.module('../../../src/shared/hook-settings.js', () => ({
+  loadFromFileOnce: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: '' }),
+}));
+
 const workerCallLog: Array<{ path: string; options: any }> = [];
 mock.module('../../../src/shared/worker-utils.js', () => ({
   ensureWorkerRunning: () => Promise.resolve(true),
@@ -42,7 +43,6 @@ mock.module('../../../src/shared/worker-utils.js', () => ({
   },
 }));
 
-// Suppress logger during tests
 import { logger } from '../../../src/utils/logger.js';
 
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
@@ -63,6 +63,12 @@ afterEach(() => {
   loggerSpies.forEach(spy => spy.mockRestore());
 });
 
+afterAll(() => {
+  mock.module('../../../src/shared/SettingsDefaultsManager.js', () => realSettingsSnapshot);
+  mock.module('../../../src/shared/hook-settings.js', () => realHookSettingsSnapshot);
+  mock.module('../../../src/shared/worker-utils.js', () => realWorkerUtilsSnapshot);
+});
+
 describe('summarizeHandler — subagent short-circuit', () => {
   it('skips summary and returns SUCCESS when agentId is set', async () => {
     const { summarizeHandler } = await import('../../../src/cli/handlers/summarize.js');
@@ -78,17 +84,10 @@ describe('summarizeHandler — subagent short-circuit', () => {
     expect(result.continue).toBe(true);
     expect(result.suppressOutput).toBe(true);
     expect(result.exitCode).toBe(0);
-    // Guard fires BEFORE any worker HTTP request. If workerHttpRequest were
-    // called, our mock would have thrown — reaching this expect proves it.
     expect(workerCallLog.length).toBe(0);
   });
 
   it('does NOT skip when only agentType is set (--agent main session still owns its summary)', async () => {
-    // agent_type without agent_id is how Claude Code signals a main session started
-    // with --agent. These are main sessions, not Task-spawned subagents, so the
-    // summary path must proceed. Here the transcript path is missing so the handler
-    // falls through to the existing no-transcriptPath return — the key assertion is
-    // that the subagent guard did NOT short-circuit (handler reached the normal path).
     const { summarizeHandler } = await import('../../../src/cli/handlers/summarize.js');
 
     const result = await summarizeHandler.execute({
@@ -123,9 +122,6 @@ describe('summarizeHandler — subagent short-circuit', () => {
   });
 
   it('falls through to existing no-transcriptPath guard in main-session context', async () => {
-    // Neither agentId nor agentType → NOT a subagent. Handler should
-    // proceed past the subagent guard and hit the existing
-    // "no transcriptPath" early return. Worker must still not be called.
     const { summarizeHandler } = await import('../../../src/cli/handlers/summarize.js');
 
     const result = await summarizeHandler.execute({

@@ -1,20 +1,40 @@
-/**
- * Shared worker-shutdown helper used by both `install` (to clear out a
- * running worker before overwriting plugin files) and `uninstall` (to
- * release file locks before deletion).
- *
- * Posts to `/api/admin/shutdown`, then polls `/api/health` until the
- * connection is refused (= worker is gone) or the timeout elapses.
- *
- * Best-effort: if the worker is not running, the POST throws and we
- * return immediately. Callers should never depend on this throwing.
- */
 
 export interface ShutdownResult {
-  /** True if we actively shut down a worker; false if none was running. */
   workerWasRunning: boolean;
-  /** True if we observed the worker stop responding before the timeout. */
-  confirmedStopped: boolean;
+  /** True only when no worker was present or health stopped responding. */
+  stopped: boolean;
+}
+
+function hasErrorCode(error: unknown, code: string, seen = new Set<unknown>()): boolean {
+  if (!error || typeof error !== 'object' || seen.has(error)) return false;
+  seen.add(error);
+  const candidate = error as { code?: unknown; cause?: unknown; errors?: unknown };
+  if (candidate.code === code) return true;
+  if (hasErrorCode(candidate.cause, code, seen)) return true;
+  return Array.isArray(candidate.errors)
+    && candidate.errors.some((nested) => hasErrorCode(nested, code, seen));
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error
+    && (error.name === 'AbortError' || error.name === 'TimeoutError');
+}
+
+function isConnectionRefused(error: unknown): boolean {
+  return hasErrorCode(error, 'ECONNREFUSED');
+}
+
+async function healthProbeConfirmsStopped(baseUrl: string): Promise<boolean> {
+  try {
+    await fetch(`${baseUrl}/api/health`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    return false;
+  } catch (error) {
+    // Only an explicit refusal proves that nothing owns the loopback port.
+    // Resets, timeouts, and protocol failures are ambiguous and fail closed.
+    return isConnectionRefused(error);
+  }
 }
 
 export async function shutdownWorkerAndWait(
@@ -25,15 +45,23 @@ export async function shutdownWorkerAndWait(
   let workerWasRunning = false;
 
   try {
-    await fetch(`${baseUrl}/api/admin/shutdown`, {
+    const response = await fetch(`${baseUrl}/api/admin/shutdown`, {
       method: 'POST',
       signal: AbortSignal.timeout(5000),
     });
     workerWasRunning = true;
-  } catch {
-    // Worker not running (connection refused) or shutdown POST timed out.
-    // Either way, nothing more to do.
-    return { workerWasRunning: false, confirmedStopped: true };
+    if (!response.ok) return { workerWasRunning, stopped: false };
+  } catch (error) {
+    // A timeout is not evidence that the worker is gone: fail closed so the
+    // installer never overwrites settings under a live, in-memory worker.
+    if (isTimeoutError(error)) {
+      return { workerWasRunning: true, stopped: false };
+    }
+    // A worker may reset the shutdown socket while exiting, and a generic
+    // fetch error can mean many other things. Confirm the loopback port is
+    // actually closed before treating this as a no-worker case.
+    const stopped = await healthProbeConfirmsStopped(baseUrl);
+    return { workerWasRunning: !stopped, stopped };
   }
 
   const pollIntervalMs = 500;
@@ -44,15 +72,13 @@ export async function shutdownWorkerAndWait(
       await fetch(`${baseUrl}/api/health`, {
         signal: AbortSignal.timeout(1000),
       });
-      // Health endpoint still responding — worker is still alive, keep waiting.
     } catch (err) {
-      // AbortError = health endpoint timed out (worker still accepting
-      // connections but slow). Keep polling. Any other error
-      // (ECONNREFUSED, ECONNRESET) means the worker is gone.
-      if (err instanceof Error && err.name === 'AbortError') continue;
-      return { workerWasRunning, confirmedStopped: true };
+      if (isConnectionRefused(err)) return { workerWasRunning, stopped: true };
+      // A reset can happen while shutdown is still in progress. Keep polling;
+      // if the port never reaches an explicit refusal, return stopped:false.
+      continue;
     }
   }
 
-  return { workerWasRunning, confirmedStopped: false };
+  return { workerWasRunning, stopped: false };
 }

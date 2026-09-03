@@ -1,31 +1,10 @@
-/**
- * One-time v12.4.3 pollution cleanup.
- *
- * Removes accumulated junk that v12.4.0/v12.4.2 fixes prevent from ever recurring:
- *   1. observer-sessions: rows that polluted user-facing search/timeline before
- *      the observer-sessions filter shipped. Cascades to user_prompts, observations,
- *      and session_summaries via existing FK ON DELETE CASCADE.
- *   2. Stuck pending_messages: poisoned chains where ≥10 rows for a single
- *      session_db_id are stuck in 'failed' or 'processing'. Threshold spares
- *      legitimate transient failures while clearing the cascade-failure cases
- *      from the pre-v12.4.2 context-overflow loop.
- *
- * After SQLite is cleaned, ~/.claude-mem/chroma/ and ~/.claude-mem/chroma-sync-state.json
- * are removed so backfillAllProjects rebuilds the vector store from the cleaned SQLite.
- *
- * Marker-file gated. Idempotent. Opt-out via CLAUDE_MEM_SKIP_CLEANUP_V12_4_3=1.
- *
- * Mirrors the runOneTimeChromaMigration / runOneTimeCwdRemap pattern in
- * ProcessManager.ts. Must run AFTER dbManager.initialize() (so migrations have
- * applied) and BEFORE ChromaSync.backfillAllProjects (so backfill sees the
- * cleaned state).
- */
 
 import path from 'path';
 import { existsSync, writeFileSync, mkdirSync, rmSync, statSync, copyFileSync, statfsSync } from 'fs';
 import { Database } from 'bun:sqlite';
 import { DATA_DIR, OBSERVER_SESSIONS_PROJECT } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
+import { openConfiguredSqliteDatabase } from '../sqlite/connection.js';
 
 const MARKER_FILENAME = '.cleanup-v12.4.3-applied';
 const STUCK_PENDING_THRESHOLD = 10;
@@ -45,16 +24,6 @@ interface MarkerPayload {
   skipped?: string;
 }
 
-/**
- * Run the one-time v12.4.3 cleanup. Safe to call on every worker startup;
- * the marker file ensures the work runs at most once per data directory.
- *
- * @param dataDirectory - Override for DATA_DIR (used in tests)
- * @param options.dryRun - When true, scans + reports counts but performs NO
- *        DB writes, NO backup, NO chroma wipe, and does NOT write the marker.
- *        Used by `claude-mem cleanup --dry-run` to preview what would happen
- *        without mutating user state. (#2126 item 5)
- */
 export function runOneTimeV12_4_3Cleanup(
   dataDirectory?: string,
   options: { dryRun?: boolean } = {},
@@ -107,27 +76,32 @@ export function runOneTimeV12_4_3Cleanup(
 }
 
 /**
- * Read-only scan: count what runOneTimeV12_4_3Cleanup *would* delete.
- * Mirrors the COUNT(*) queries from runObserverSessionsPurge and
- * runStuckPendingPurge. Opens the DB read-only — never mutates.
+ * Count the observer-sessions rows and the user_prompts / observations /
+ * session_summaries rows that cascade-delete with them. Shared by the
+ * read-only dry-run scan and the live purge so both report identical figures.
  */
+function countObserverSessionRows(db: Database): { sessions: number; cascadeRows: number } {
+  const sessions = (db.prepare(`SELECT COUNT(*) AS n FROM sdk_sessions WHERE project = ?`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n;
+  const cascadeRows =
+    (db.prepare(`SELECT COUNT(*) AS n FROM user_prompts WHERE session_db_id IN (SELECT id FROM sdk_sessions WHERE project = ?)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n
+    + (db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE memory_session_id IN (SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND memory_session_id IS NOT NULL)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n
+    + (db.prepare(`SELECT COUNT(*) AS n FROM session_summaries WHERE memory_session_id IN (SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND memory_session_id IS NOT NULL)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n;
+  return { sessions, cascadeRows };
+}
+
 function scanCleanupCounts(dbPath: string): CleanupCounts {
   const counts = emptyCounts();
   const db = new Database(dbPath, { readonly: true });
   try {
-    counts.observerSessions = (
-      db.prepare(`SELECT COUNT(*) AS n FROM sdk_sessions WHERE project = ?`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }
-    ).n;
-    counts.observerCascadeRows =
-      (db.prepare(`SELECT COUNT(*) AS n FROM user_prompts WHERE content_session_id IN (SELECT content_session_id FROM sdk_sessions WHERE project = ?)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n
-      + (db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE memory_session_id IN (SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND memory_session_id IS NOT NULL)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n
-      + (db.prepare(`SELECT COUNT(*) AS n FROM session_summaries WHERE memory_session_id IN (SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND memory_session_id IS NOT NULL)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n;
+    const observer = countObserverSessionRows(db);
+    counts.observerSessions = observer.sessions;
+    counts.observerCascadeRows = observer.cascadeRows;
     counts.stuckPendingMessages = (db.prepare(
       `SELECT COUNT(*) AS n FROM pending_messages
-         WHERE status IN ('failed', 'processing')
+         WHERE status = 'processing'
            AND session_db_id IN (
              SELECT session_db_id FROM pending_messages
-              WHERE status IN ('failed', 'processing')
+              WHERE status = 'processing'
               GROUP BY session_db_id
               HAVING COUNT(*) >= ?
            )`
@@ -148,18 +122,48 @@ function executeCleanup(dbPath: string, effectiveDataDir: string, markerPath: st
   const required = Math.ceil(dbSize * 1.2) + 100 * 1024 * 1024;
 
   let backupPath: string | null = null;
+  let fsStats: ReturnType<typeof statfsSync> | undefined;
   try {
-    const fs = statfsSync(effectiveDataDir);
-    const free = Number(fs.bavail) * Number(fs.bsize);
-    if (free < required) {
-      // Don't write the marker — once the user frees disk space, the next
-      // worker startup should retry the cleanup rather than skipping forever.
-      logger.error('SYSTEM', 'Insufficient disk for v12.4.3 backup; skipping cleanup (will retry on next startup)', { dbSize, free, required });
-      return;
-    }
+    fsStats = statfsSync(effectiveDataDir);
   } catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err));
     logger.warn('SYSTEM', 'statfsSync failed; proceeding without disk-space pre-flight', {}, error);
+  }
+
+  if (fsStats) {
+    const bsize = Number(fsStats.bsize);
+    const bavail = Number(fsStats.bavail);
+
+    // Bun <= 1.3.14 on darwin-x64 returns a misaligned statfs struct
+    // (bsize = 0, fields shifted by one slot). Tracking issue:
+    //   https://github.com/oven-sh/bun/issues/31133
+    // Fix landed upstream in:
+    //   https://github.com/oven-sh/bun/pull/31139
+    // and will ship in the next Bun release after 1.3.14. Until then, any
+    // `bavail * bsize` math returns 0 and this gate would permanently skip
+    // the cleanup with a misleading `free=0` error. Treat non-credible
+    // readings (bsize <= 0, NaN, or non-finite) as "skip the gate" rather
+    // than "disk is full" -- a real out-of-space condition will still
+    // surface from the subsequent VACUUM INTO / copyFileSync.
+    if (!Number.isFinite(bsize) || !Number.isFinite(bavail) || bsize <= 0) {
+      logger.warn(
+        'SYSTEM',
+        'statfsSync returned non-credible values; proceeding without disk-space pre-flight',
+        {
+          bsize,
+          bavail,
+          runtime: typeof Bun !== 'undefined' ? `bun ${Bun.version}` : 'node',
+          platform: `${process.platform}-${process.arch}`,
+          hint: 'see https://github.com/oven-sh/bun/issues/31133 for the darwin-x64 case',
+        },
+      );
+    } else {
+      const free = bavail * bsize;
+      if (free < required) {
+        logger.error('SYSTEM', 'Insufficient disk for v12.4.3 backup; skipping cleanup (will retry on next startup)', { dbSize, free, required });
+        return;
+      }
+    }
   }
 
   const effectiveBackupsDir = path.join(effectiveDataDir, 'backups');
@@ -169,25 +173,19 @@ function executeCleanup(dbPath: string, effectiveDataDir: string, markerPath: st
 
   const backupDb = new Database(dbPath, { readonly: true });
   let vacuumFailed = false;
-  let vacuumError: Error | null = null;
   try {
     backupDb.run(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
     logger.info('SYSTEM', 'v12.4.3 backup created via VACUUM INTO', { backupPath, dbSize });
   } catch (err: unknown) {
     vacuumFailed = true;
-    vacuumError = err instanceof Error ? err : new Error(String(err));
+    const vacuumError = err instanceof Error ? err : new Error(String(err));
+    logger.warn('SYSTEM', 'VACUUM INTO failed, falling back to copyFileSync', {}, vacuumError);
   }
-  // Close before any fallback: on Windows an open SQLite handle holds a
-  // file lock that can prevent copyFileSync from reading the source.
   backupDb.close();
 
   if (vacuumFailed) {
-    logger.warn('SYSTEM', 'VACUUM INTO failed, falling back to copyFileSync', {}, vacuumError ?? undefined);
     try {
       copyFileSync(dbPath, backupPath);
-      // The DB is in WAL mode; recent committed pages may live in -wal/-shm.
-      // VACUUM INTO captures them automatically; copyFileSync does not, so
-      // mirror them alongside so the backup represents the same state.
       const walPath = `${dbPath}-wal`;
       const shmPath = `${dbPath}-shm`;
       if (existsSync(walPath)) copyFileSync(walPath, `${backupPath}-wal`);
@@ -201,8 +199,7 @@ function executeCleanup(dbPath: string, effectiveDataDir: string, markerPath: st
   }
 
   const counts = emptyCounts();
-  const db = new Database(dbPath);
-  // PRAGMA foreign_keys must be set OUTSIDE a transaction to take effect on this connection.
+  const db = openConfiguredSqliteDatabase(dbPath);
   db.run('PRAGMA foreign_keys = ON');
 
   try {
@@ -212,9 +209,6 @@ function executeCleanup(dbPath: string, effectiveDataDir: string, markerPath: st
     db.close();
   }
 
-  // SQLite purge succeeded; chroma wipe failure must NOT re-run the migration
-  // on the next startup or we accumulate one new backup per boot. Capture the
-  // failure on the marker instead.
   let chromaWiped = false;
   let chromaWipeError: string | undefined;
   try {
@@ -244,69 +238,67 @@ function executeCleanup(dbPath: string, effectiveDataDir: string, markerPath: st
 function runObserverSessionsPurge(db: Database, counts: CleanupCounts): void {
   db.run('BEGIN IMMEDIATE');
   try {
-    // Count rows before the delete: bun:sqlite's result.changes inflates with
-    // FTS-trigger and cascade row counts, so it can't stand in for a session
-    // count or a cascade-row count on its own.
-    const sessionCount = (db.prepare(`SELECT COUNT(*) AS n FROM sdk_sessions WHERE project = ?`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n;
-    const cascadeRows =
-      (db.prepare(`SELECT COUNT(*) AS n FROM user_prompts WHERE content_session_id IN (SELECT content_session_id FROM sdk_sessions WHERE project = ?)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n
-      + (db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE memory_session_id IN (SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND memory_session_id IS NOT NULL)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n
-      + (db.prepare(`SELECT COUNT(*) AS n FROM session_summaries WHERE memory_session_id IN (SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND memory_session_id IS NOT NULL)`).get(OBSERVER_SESSIONS_PROJECT) as { n: number }).n;
-
-    db.run(`DELETE FROM sdk_sessions WHERE project = ?`, [OBSERVER_SESSIONS_PROJECT]);
-    counts.observerSessions = sessionCount;
-    counts.observerCascadeRows = cascadeRows;
-
-    db.run('COMMIT');
-    logger.info('SYSTEM', 'v12.4.3: observer-sessions purge committed', {
-      sessions: counts.observerSessions,
-      cascadeRows: counts.observerCascadeRows,
-    });
+    deleteObserverSessionsAndCommit(db, counts);
   } catch (err: unknown) {
-    // Defensive: SQLite may have already auto-rolled back on certain
-    // constraint failures. Don't let a no-op ROLLBACK shadow the real error.
+    const error = err instanceof Error ? err : new Error(String(err));
+    logger.error('SYSTEM', 'v12.4.3: observer-sessions purge failed, rolling back', {}, error);
     try { db.run('ROLLBACK'); } catch { /* already rolled back */ }
     throw err;
   }
 }
 
+function deleteObserverSessionsAndCommit(db: Database, counts: CleanupCounts): void {
+  const { sessions, cascadeRows } = countObserverSessionRows(db);
+
+  db.run(`DELETE FROM sdk_sessions WHERE project = ?`, [OBSERVER_SESSIONS_PROJECT]);
+  counts.observerSessions = sessions;
+  counts.observerCascadeRows = cascadeRows;
+
+  db.run('COMMIT');
+  logger.info('SYSTEM', 'v12.4.3: observer-sessions purge committed', {
+    sessions: counts.observerSessions,
+    cascadeRows: counts.observerCascadeRows,
+  });
+}
+
 function runStuckPendingPurge(db: Database, counts: CleanupCounts): void {
   db.run('BEGIN IMMEDIATE');
   try {
-    // Pre-count for consistency with runObserverSessionsPurge: result.changes
-    // would be reliable today (no FTS on pending_messages) but the explicit
-    // count protects against future schema changes.
-    const stuckCount = (db.prepare(
-      `SELECT COUNT(*) AS n FROM pending_messages
-         WHERE status IN ('failed', 'processing')
-           AND session_db_id IN (
-             SELECT session_db_id FROM pending_messages
-              WHERE status IN ('failed', 'processing')
-              GROUP BY session_db_id
-              HAVING COUNT(*) >= ?
-           )`
-    ).get(STUCK_PENDING_THRESHOLD) as { n: number }).n;
-
-    db.run(
-      `DELETE FROM pending_messages
-         WHERE status IN ('failed', 'processing')
-           AND session_db_id IN (
-             SELECT session_db_id FROM pending_messages
-              WHERE status IN ('failed', 'processing')
-              GROUP BY session_db_id
-              HAVING COUNT(*) >= ?
-           )`,
-      [STUCK_PENDING_THRESHOLD]
-    );
-    counts.stuckPendingMessages = stuckCount;
-    db.run('COMMIT');
-    logger.info('SYSTEM', 'v12.4.3: stuck pending_messages purge committed', { rows: counts.stuckPendingMessages });
+    deleteStuckPendingAndCommit(db, counts);
   } catch (err: unknown) {
-    // Defensive: SQLite may have already auto-rolled back on certain
-    // constraint failures. Don't let a no-op ROLLBACK shadow the real error.
+    const error = err instanceof Error ? err : new Error(String(err));
+    logger.error('SYSTEM', 'v12.4.3: stuck pending_messages purge failed, rolling back', {}, error);
     try { db.run('ROLLBACK'); } catch { /* already rolled back */ }
     throw err;
   }
+}
+
+function deleteStuckPendingAndCommit(db: Database, counts: CleanupCounts): void {
+  const stuckCount = (db.prepare(
+    `SELECT COUNT(*) AS n FROM pending_messages
+       WHERE status = 'processing'
+         AND session_db_id IN (
+           SELECT session_db_id FROM pending_messages
+            WHERE status = 'processing'
+            GROUP BY session_db_id
+            HAVING COUNT(*) >= ?
+         )`
+  ).get(STUCK_PENDING_THRESHOLD) as { n: number }).n;
+
+  db.run(
+    `DELETE FROM pending_messages
+       WHERE status = 'processing'
+         AND session_db_id IN (
+           SELECT session_db_id FROM pending_messages
+            WHERE status = 'processing'
+            GROUP BY session_db_id
+            HAVING COUNT(*) >= ?
+         )`,
+    [STUCK_PENDING_THRESHOLD]
+  );
+  counts.stuckPendingMessages = stuckCount;
+  db.run('COMMIT');
+  logger.info('SYSTEM', 'v12.4.3: stuck pending_messages purge committed', { rows: counts.stuckPendingMessages });
 }
 
 function wipeChromaArtifacts(effectiveDataDir: string): boolean {

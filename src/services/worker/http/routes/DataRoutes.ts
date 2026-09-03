@@ -1,17 +1,10 @@
-/**
- * Data Routes
- *
- * Handles data retrieval operations: observations, summaries, prompts, stats, processing status.
- * All endpoints use direct database access via service layer.
- */
 
 import express, { Request, Response } from 'express';
 import { z } from 'zod';
 import path from 'path';
 import { readFileSync, statSync, existsSync } from 'fs';
 import { logger } from '../../../../utils/logger.js';
-import { homedir } from 'os';
-import { getPackageRoot } from '../../../../shared/paths.js';
+import { getPackageRoot, paths } from '../../../../shared/paths.js';
 import { getWorkerPort } from '../../../../shared/worker-utils.js';
 import { PaginationHelper } from '../../PaginationHelper.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
@@ -22,10 +15,10 @@ import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { validateBody } from '../middleware/validateBody.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { getObservationsByFilePath } from '../../../sqlite/observations/get.js';
+import { getFirstObservationCreatedAt } from '../../../sqlite/observations/recent.js';
+import { getUptimeSeconds } from '../../../../shared/uptime.js';
+import { assertCanonicalDecimal, type ContentKind } from '../../../sync/CanonicalContent.js';
 
-// Plan 06 Phase 3 — per-route Zod schemas. Coercions match the legacy
-// behaviour where MCP clients sometimes send arrays as JSON-encoded strings
-// or comma-separated strings.
 const integerArrayLike = z.preprocess((value) => {
   if (Array.isArray(value)) return value;
   if (typeof value === 'string') {
@@ -35,8 +28,6 @@ const integerArrayLike = z.preprocess((value) => {
     } catch {
       // not JSON, fall through to comma split
     }
-    // Keep NaN values so the inner z.number().int() schema rejects them
-    // — coercion does not silently drop garbage input.
     return value.split(',').map((part) => Number(part.trim()));
   }
   return value;
@@ -61,13 +52,13 @@ const observationsBatchSchema = z.object({
   orderBy: z.enum(['date_desc', 'date_asc']).optional(),
   limit: z.number().int().positive().optional(),
   project: z.string().optional(),
+  platformSource: z.string().optional(),
+  platform_source: z.string().optional(),
 }).passthrough();
 
 const sdkSessionsBatchSchema = z.object({
   memorySessionIds: stringArrayLike,
 }).passthrough();
-
-const setProcessingSchema = z.object({}).passthrough();
 
 const importSchema = z.object({
   sessions: z.array(z.unknown()).optional(),
@@ -89,68 +80,53 @@ export class DataRoutes extends BaseRouteHandler {
   }
 
   setupRoutes(app: express.Application): void {
-    // Pagination endpoints
     app.get('/api/observations', this.handleGetObservations.bind(this));
     app.get('/api/summaries', this.handleGetSummaries.bind(this));
     app.get('/api/prompts', this.handleGetPrompts.bind(this));
 
-    // Fetch by ID endpoints
     app.get('/api/observation/:id', this.handleGetObservationById.bind(this));
     app.get('/api/observations/by-file', this.handleGetObservationsByFile.bind(this));
     app.post('/api/observations/batch', validateBody(observationsBatchSchema), this.handleGetObservationsByIds.bind(this));
     app.get('/api/session/:id', this.handleGetSessionById.bind(this));
     app.post('/api/sdk-sessions/batch', validateBody(sdkSessionsBatchSchema), this.handleGetSdkSessionsByIds.bind(this));
     app.get('/api/prompt/:id', this.handleGetPromptById.bind(this));
+    app.delete('/api/observation/:id', this.handleDeleteObservation.bind(this));
+    app.delete('/api/summary/:id', this.handleDeleteSummary.bind(this));
+    app.delete('/api/prompt/:id', this.handleDeletePrompt.bind(this));
 
-    // Metadata endpoints
     app.get('/api/stats', this.handleGetStats.bind(this));
     app.get('/api/projects', this.handleGetProjects.bind(this));
 
-    // Processing status endpoints
     app.get('/api/processing-status', this.handleGetProcessingStatus.bind(this));
-    app.post('/api/processing', validateBody(setProcessingSchema), this.handleSetProcessing.bind(this));
 
-    // Import endpoint
     app.post('/api/import', validateBody(importSchema), this.handleImport.bind(this));
   }
 
-  /**
-   * Get paginated observations
-   */
   private handleGetObservations = this.wrapHandler((req: Request, res: Response): void => {
     const { offset, limit, project, platformSource } = this.parsePaginationParams(req);
     const result = this.paginationHelper.getObservations(offset, limit, project, platformSource);
     res.json(result);
   });
 
-  /**
-   * Get paginated summaries
-   */
   private handleGetSummaries = this.wrapHandler((req: Request, res: Response): void => {
     const { offset, limit, project, platformSource } = this.parsePaginationParams(req);
     const result = this.paginationHelper.getSummaries(offset, limit, project, platformSource);
     res.json(result);
   });
 
-  /**
-   * Get paginated user prompts
-   */
   private handleGetPrompts = this.wrapHandler((req: Request, res: Response): void => {
     const { offset, limit, project, platformSource } = this.parsePaginationParams(req);
     const result = this.paginationHelper.getPrompts(offset, limit, project, platformSource);
     res.json(result);
   });
 
-  /**
-   * Get observation by ID
-   * GET /api/observation/:id
-   */
   private handleGetObservationById = this.wrapHandler((req: Request, res: Response): void => {
     const id = this.parseIntParam(req, res, 'id');
     if (id === null) return;
 
     const store = this.dbManager.getSessionStore();
-    const observation = store.getObservationById(id);
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
+    const observation = store.getObservationById(id, platformSource);
 
     if (!observation) {
       this.notFound(res, `Observation #${id} not found`);
@@ -160,13 +136,15 @@ export class DataRoutes extends BaseRouteHandler {
     res.json(observation);
   });
 
-  /**
-   * Get observations associated with a file path, scoped to projects
-   * GET /api/observations/by-file?path=<file_path>&projects=<comma,separated>&limit=15
-   */
   private handleGetObservationsByFile = this.wrapHandler((req: Request, res: Response): void => {
-    const filePath = req.query.path as string | undefined;
-    if (!filePath) {
+    // #2691 — `path` may be repeated (?path=abs&path=rel) to carry multiple
+    // candidate forms (absolute, project-root-relative, cwd-relative) so the
+    // query matches however PostToolUse stored the path. Paths can contain
+    // commas, so we rely on repeated query params rather than comma-splitting.
+    const rawPath = req.query.path;
+    const candidatePaths = (Array.isArray(rawPath) ? rawPath : [rawPath])
+      .filter((p): p is string => typeof p === 'string' && p.length > 0);
+    if (candidatePaths.length === 0) {
       this.badRequest(res, 'path query parameter is required');
       return;
     }
@@ -175,18 +153,14 @@ export class DataRoutes extends BaseRouteHandler {
     const projects = projectsParam ? projectsParam.split(',').filter(Boolean) : undefined;
     const parsedLimit = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
     const limit = Number.isFinite(parsedLimit) && parsedLimit! > 0 ? parsedLimit : undefined;
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
 
     const db = this.dbManager.getSessionStore().db;
-    const observations = getObservationsByFilePath(db, filePath, { projects, limit });
+    const observations = getObservationsByFilePath(db, candidatePaths, { projects, limit, platformSource });
 
     res.json({ observations, count: observations.length });
   });
 
-  /**
-   * Get observations by array of IDs
-   * POST /api/observations/batch
-   * Body: { ids: number[], orderBy?: 'date_desc' | 'date_asc', limit?: number, project?: string }
-   */
   private handleGetObservationsByIds = this.wrapHandler((req: Request, res: Response): void => {
     const { ids, orderBy, limit, project } = req.body as z.infer<typeof observationsBatchSchema>;
 
@@ -196,21 +170,20 @@ export class DataRoutes extends BaseRouteHandler {
     }
 
     const store = this.dbManager.getSessionStore();
-    const observations = store.getObservationsByIds(ids, { orderBy, limit, project });
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
+    const observations = store.getObservationsByIds(ids, { orderBy, limit, project, platformSource });
 
     res.json(observations);
   });
 
-  /**
-   * Get session by ID
-   * GET /api/session/:id
-   */
   private handleGetSessionById = this.wrapHandler((req: Request, res: Response): void => {
     const id = this.parseIntParam(req, res, 'id');
     if (id === null) return;
 
     const store = this.dbManager.getSessionStore();
-    const sessions = store.getSessionSummariesByIds([id]);
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
+    const project = DataRoutes.firstString(req.query.project);
+    const sessions = store.getSessionSummariesByIds([id], { project, platformSource });
 
     if (sessions.length === 0) {
       this.notFound(res, `Session #${id} not found`);
@@ -220,11 +193,6 @@ export class DataRoutes extends BaseRouteHandler {
     res.json(sessions[0]);
   });
 
-  /**
-   * Get SDK sessions by SDK session IDs
-   * POST /api/sdk-sessions/batch
-   * Body: { memorySessionIds: string[] }
-   */
   private handleGetSdkSessionsByIds = this.wrapHandler((req: Request, res: Response): void => {
     const { memorySessionIds } = req.body as z.infer<typeof sdkSessionsBatchSchema>;
 
@@ -233,16 +201,14 @@ export class DataRoutes extends BaseRouteHandler {
     res.json(sessions);
   });
 
-  /**
-   * Get user prompt by ID
-   * GET /api/prompt/:id
-   */
   private handleGetPromptById = this.wrapHandler((req: Request, res: Response): void => {
     const id = this.parseIntParam(req, res, 'id');
     if (id === null) return;
 
     const store = this.dbManager.getSessionStore();
-    const prompts = store.getUserPromptsByIds([id]);
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
+    const project = DataRoutes.firstString(req.query.project);
+    const prompts = store.getUserPromptsByIds([id], { project, platformSource });
 
     if (prompts.length === 0) {
       this.notFound(res, `Prompt #${id} not found`);
@@ -252,32 +218,90 @@ export class DataRoutes extends BaseRouteHandler {
     res.json(prompts[0]);
   });
 
-  /**
-   * Get database statistics (with worker metadata)
-   */
+  private handleDeleteObservation = this.wrapHandler((req: Request, res: Response): void => {
+    this.deleteSyncedContent(req, res, 'observation', 'observations');
+  });
+
+  private handleDeleteSummary = this.wrapHandler((req: Request, res: Response): void => {
+    this.deleteSyncedContent(req, res, 'summary', 'session_summaries');
+  });
+
+  private handleDeletePrompt = this.wrapHandler((req: Request, res: Response): void => {
+    this.deleteSyncedContent(req, res, 'prompt', 'user_prompts');
+  });
+
+  /** Production deletion surface: tombstone enqueue and row delete are one transaction. */
+  private deleteSyncedContent(
+    req: Request,
+    res: Response,
+    kind: ContentKind,
+    table: 'observations' | 'session_summaries' | 'user_prompts',
+  ): void {
+    let originLocalId: string;
+    try {
+      originLocalId = assertCanonicalDecimal(req.params.id, { positive: true });
+    } catch {
+      this.badRequest(res, 'id must be a positive canonical decimal string');
+      return;
+    }
+
+    const store = this.dbManager.getSessionStore();
+    const row = store.db.prepare(`
+      SELECT CAST(id AS TEXT) AS id FROM ${table}
+      WHERE id = ? AND origin_device_id IS NULL
+    `).get(originLocalId) as { id: string } | undefined;
+    if (!row) {
+      this.notFound(res, `${kind} #${originLocalId} not found`);
+      return;
+    }
+
+    const cloudSync = this.dbManager.getCloudSync();
+    let entityRev: string | null = null;
+    if (cloudSync?.isConfigured()) {
+      if (!cloudSync.status().deviceId) {
+        res.status(503).json({ error: 'cloud sync identity unavailable; refusing an unreplicated delete' });
+        return;
+      }
+      entityRev = cloudSync.queueDelete(kind, originLocalId);
+    } else {
+      // A row with an acknowledged entity head must never be silently deleted
+      // while its sync identity is unavailable: that would strand replicas.
+      const acknowledged = store.db.prepare(`
+        SELECT 1 AS found FROM sync_entity_heads
+        WHERE kind = ? AND origin_local_id = ? LIMIT 1
+      `).get(kind, originLocalId) as { found: number } | undefined;
+      if (acknowledged) {
+        res.status(503).json({ error: 'cloud sync unavailable; refusing an unreplicated delete' });
+        return;
+      }
+      store.db.prepare(
+        `DELETE FROM ${table} WHERE id = ? AND origin_device_id IS NULL`
+      ).run(originLocalId);
+    }
+
+    res.json({ success: true, id: originLocalId, kind, entity_rev: entityRev });
+  }
+
   private handleGetStats = this.wrapHandler((req: Request, res: Response): void => {
     const db = this.dbManager.getSessionStore().db;
 
-    // Read version from package.json
     const packageRoot = getPackageRoot();
     const packageJsonPath = path.join(packageRoot, 'package.json');
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
     const version = packageJson.version;
 
-    // Get database stats
     const totalObservations = db.prepare('SELECT COUNT(*) as count FROM observations').get() as { count: number };
     const totalSessions = db.prepare('SELECT COUNT(*) as count FROM sdk_sessions').get() as { count: number };
     const totalSummaries = db.prepare('SELECT COUNT(*) as count FROM session_summaries').get() as { count: number };
+    const firstObservationAt = getFirstObservationCreatedAt(db);
 
-    // Get database file size and path
-    const dbPath = path.join(homedir(), '.claude-mem', 'claude-mem.db');
+    const dbPath = paths.database();
     let dbSize = 0;
     if (existsSync(dbPath)) {
       dbSize = statSync(dbPath).size;
     }
 
-    // Worker metadata
-    const uptime = Math.floor((Date.now() - this.startTime) / 1000);
+    const uptime = getUptimeSeconds(this.startTime);
     const activeSessions = this.sessionManager.getActiveSessionCount();
     const sseClients = this.sseBroadcaster.getClientCount();
 
@@ -294,19 +318,15 @@ export class DataRoutes extends BaseRouteHandler {
         size: dbSize,
         observations: totalObservations.count,
         sessions: totalSessions.count,
-        summaries: totalSummaries.count
+        summaries: totalSummaries.count,
+        firstObservationAt
       }
     });
   });
 
-  /**
-   * Get list of distinct projects from observations
-   * GET /api/projects
-   */
   private handleGetProjects = this.wrapHandler((req: Request, res: Response): void => {
     const store = this.dbManager.getSessionStore();
-    const rawPlatformSource = req.query.platformSource as string | undefined;
-    const platformSource = rawPlatformSource ? normalizePlatformSource(rawPlatformSource) : undefined;
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
 
     if (platformSource) {
       const projects = store.getAllProjects(platformSource);
@@ -321,49 +341,21 @@ export class DataRoutes extends BaseRouteHandler {
     res.json(store.getProjectCatalog());
   });
 
-  /**
-   * Get current processing status
-   * GET /api/processing-status
-   */
-  private handleGetProcessingStatus = this.wrapHandler((req: Request, res: Response): void => {
-    const isProcessing = this.sessionManager.isAnySessionProcessing();
-    const queueDepth = this.sessionManager.getTotalActiveWork(); // Includes queued + actively processing
+  private handleGetProcessingStatus = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const isProcessing = await this.sessionManager.isAnySessionProcessing();
+    const queueDepth = await this.sessionManager.getTotalActiveWork(); 
     res.json({ isProcessing, queueDepth });
   });
 
-  /**
-   * Set processing status (called by hooks)
-   * NOTE: This now broadcasts computed status based on active processing (ignores input)
-   */
-  private handleSetProcessing = this.wrapHandler((req: Request, res: Response): void => {
-    // Broadcast current computed status (ignores manual input)
-    this.workerService.broadcastProcessingStatus();
-
-    const isProcessing = this.sessionManager.isAnySessionProcessing();
-    const queueDepth = this.sessionManager.getTotalQueueDepth();
-    const activeSessions = this.sessionManager.getActiveSessionCount();
-
-    res.json({ status: 'ok', isProcessing, queueDepth, activeSessions });
-  });
-
-  /**
-   * Parse pagination parameters from request query
-   */
   private parsePaginationParams(req: Request): { offset: number; limit: number; project?: string; platformSource?: string } {
     const offset = parseInt(req.query.offset as string, 10) || 0;
-    const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100); // Max 100
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100); 
     const project = req.query.project as string | undefined;
-    const rawPlatformSource = req.query.platformSource as string | undefined;
-    const platformSource = rawPlatformSource ? normalizePlatformSource(rawPlatformSource) : undefined;
+    const platformSource = this.getOptionalPlatformSourceFromRequest(req);
 
     return { offset, limit, project, platformSource };
   }
 
-  /**
-   * Import memories from export file
-   * POST /api/import
-   * Body: { sessions: [], summaries: [], observations: [], prompts: [] }
-   */
   private handleImport = this.wrapHandler((req: Request, res: Response): void => {
     const { sessions, summaries, observations, prompts } = req.body;
 
@@ -379,11 +371,26 @@ export class DataRoutes extends BaseRouteHandler {
     };
 
     const store = this.dbManager.getSessionStore();
+    const sessionContextByKey = new Map<string, { id: number; platformSource: string }>();
+    const sessionContextsByContentId = new Map<string, Array<{ id: number; platformSource: string }>>();
+    const sessionContextKey = (platformSource: string, contentSessionId: string): string =>
+      `${platformSource}\0${contentSessionId}`;
+    const rememberSessionContext = (session: any, id: number): void => {
+      if (!session || typeof session !== 'object' || typeof session.content_session_id !== 'string') {
+        return;
+      }
+      const platformSource = normalizePlatformSource(session.platform_source);
+      const context = { id, platformSource };
+      sessionContextByKey.set(sessionContextKey(platformSource, session.content_session_id), context);
+      const existing = sessionContextsByContentId.get(session.content_session_id) ?? [];
+      existing.push(context);
+      sessionContextsByContentId.set(session.content_session_id, existing);
+    };
 
-    // Import sessions first (dependency for everything else)
     if (Array.isArray(sessions)) {
       for (const session of sessions) {
         const result = store.importSdkSession(session);
+        rememberSessionContext(session, result.id);
         if (result.imported) {
           stats.sessionsImported++;
         } else {
@@ -392,7 +399,6 @@ export class DataRoutes extends BaseRouteHandler {
       }
     }
 
-    // Import summaries (depends on sessions)
     if (Array.isArray(summaries)) {
       for (const summary of summaries) {
         const result = store.importSessionSummary(summary);
@@ -404,7 +410,6 @@ export class DataRoutes extends BaseRouteHandler {
       }
     }
 
-    // Import observations (depends on sessions)
     const importedObservations: Array<{ id: number; obs: typeof observations[0] }> = [];
     if (Array.isArray(observations)) {
       for (const obs of observations) {
@@ -417,16 +422,10 @@ export class DataRoutes extends BaseRouteHandler {
         }
       }
 
-      // Rebuild FTS index so imported observations are immediately searchable.
-      // The FTS5 content table relies on triggers for incremental updates, but
-      // those triggers may not have fired correctly for all import paths.
       if (stats.observationsImported > 0) {
         store.rebuildObservationsFTSIndex();
       }
 
-      // Sync imported observations to ChromaDB for vector search.
-      // Fire-and-forget: Chroma sync failure should not block the import response.
-      // Bounded concurrency to prevent overwhelming Chroma on large imports.
       const chromaSync = this.dbManager.getChromaSync();
       if (chromaSync && importedObservations.length > 0) {
         const CHROMA_SYNC_CONCURRENCY = 8;
@@ -436,6 +435,15 @@ export class DataRoutes extends BaseRouteHandler {
         };
 
         const syncOne = async ({ id, obs }: { id: number; obs: any }) => {
+          const sourceRow = store.db.prepare(`
+            SELECT COALESCE(NULLIF(platform_source, ''), 'claude') as platform_source
+            FROM sdk_sessions
+            WHERE memory_session_id = ?
+            LIMIT 1
+          `).get(obs.memory_session_id) as { platform_source?: string } | undefined;
+          const platformSource = typeof obs.platform_source === 'string'
+            ? normalizePlatformSource(obs.platform_source)
+            : normalizePlatformSource(sourceRow?.platform_source);
           const parsedObs = {
             type: obs.type || 'discovery',
             title: obs.title || null,
@@ -454,13 +462,12 @@ export class DataRoutes extends BaseRouteHandler {
             parsedObs,
             obs.prompt_number || 0,
             obs.created_at_epoch,
-            obs.discovery_tokens || 0
+            platformSource
           ).catch(err => {
             logger.error('CHROMA', 'Import ChromaDB sync failed', { id }, err as Error);
           });
         };
 
-        // Fire-and-forget: process in batches but don't block the response
         (async () => {
           for (let i = 0; i < importedObservations.length; i += CHROMA_SYNC_CONCURRENCY) {
             const batch = importedObservations.slice(i, i + CHROMA_SYNC_CONCURRENCY);
@@ -472,10 +479,43 @@ export class DataRoutes extends BaseRouteHandler {
       }
     }
 
-    // Import prompts (depends on sessions)
     if (Array.isArray(prompts)) {
       for (const prompt of prompts) {
-        const result = store.importUserPrompt(prompt);
+        let promptToImport = prompt;
+        if (prompt && typeof prompt === 'object' && !Array.isArray(prompt)) {
+          const promptRecord = prompt as Record<string, unknown>;
+          const contentSessionId = typeof promptRecord.content_session_id === 'string'
+            ? promptRecord.content_session_id
+            : undefined;
+          const explicitPlatformSource = typeof promptRecord.platform_source === 'string'
+            ? normalizePlatformSource(promptRecord.platform_source)
+            : undefined;
+
+          if (contentSessionId) {
+            let sessionContext: { id: number; platformSource: string } | undefined;
+            if (explicitPlatformSource) {
+              sessionContext = sessionContextByKey.get(sessionContextKey(explicitPlatformSource, contentSessionId));
+            } else {
+              const candidates = sessionContextsByContentId.get(contentSessionId) ?? [];
+              sessionContext = candidates.length === 1 ? candidates[0] : undefined;
+            }
+
+            if (sessionContext) {
+              promptToImport = {
+                ...promptRecord,
+                session_db_id: sessionContext.id,
+                platform_source: explicitPlatformSource ?? sessionContext.platformSource,
+              };
+            } else if (explicitPlatformSource) {
+              promptToImport = {
+                ...promptRecord,
+                platform_source: explicitPlatformSource,
+              };
+            }
+          }
+        }
+
+        const result = store.importUserPrompt(promptToImport as any);
         if (result.imported) {
           stats.promptsImported++;
         } else {
